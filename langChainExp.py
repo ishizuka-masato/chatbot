@@ -21,13 +21,16 @@ from langchain.schema import (
     SystemMessage,
     HumanMessage,
 )
+from langchain.callbacks import get_openai_callback
 from langchain.chains.summarize import load_summarize_chain
+from llama_index import download_loader
 
 # サイドバーの作成
 user_api_key = st.sidebar.text_input( 
     label="OpenAI API key",
     placeholder="Paste your openAI API key",
     type="password")
+
 
 os.environ['OPENAI_API_KEY'] = user_api_key
 
@@ -60,23 +63,26 @@ if uploaded_file :
         tmp_file.write(uploaded_file.getvalue()) # getvalue()：バッファの全内容を含む bytes を返す
         tmp_file_path = tmp_file.name # 作成したファイルのディレクトリを保管
 
-    # PDFドキュメントのの読み込み
-    loader = PyPDFLoader(file_path=tmp_file_path) 
-    # テキストをページごとに分割 
-    documents = loader.load_and_split(text_splitter)
+    def _load_documents(file_path: str) -> list:
+        CJKPDFReader = download_loader("CJKPDFReader")
+        loader = CJKPDFReader(concat_pages=False)
+        document = loader.load_data(file=file_path)
+        langchain_documents = [d.to_langchain_format() for d in document]
+        return langchain_documents
 
-    #langchain_documents = [d.to_langchain_format() for d in documents]
-
+    documents = _load_documents(tmp_file_path)
+    
     # OpenAIの埋め込みモデルの初期化（テキストデータを埋め込みベクトルに変換するために使用）
     embeddings = OpenAIEmbeddings()
     # テキストデータと埋め込みモデルを使用して、FAISSを介して文書の埋め込みベクトルを生成
-    vectors = FAISS.from_documents(documents, embeddings) # FAISS：Meta製の近似最近傍探索ライブラリ
+    vectorstore = FAISS.from_documents(documents, embeddings) # FAISS：Meta製の近似最近傍探索ライブラリ
 
     # ChatOpenAIと、生成された埋め込みベクトルを持つリトリーバを使用して、対話型リトリーバルチェーンを初期化。
     # ユーザーのクエリに対して適切な応答を生成するために使用
     chain_chat = ConversationalRetrievalChain.from_llm(
         llm = llm,
-        retriever=vectors.as_retriever()
+        retriever=vectorstore.as_retriever(),
+        return_source_documents=True # 回答文の作成に関連した元テキスト群についても示すように指定
         )
 
     # 入力したクエリを元にChatOpenAIモデルからの応答を返す関数
@@ -94,118 +100,24 @@ if uploaded_file :
 
     # ['generated']:モデルから生成された回答を保存
     if 'generated' not in st.session_state:
-        st.session_state['generated'] = ["読み込んだPDFファイルの名前：" + uploaded_file.name]
+        st.session_state['generated'] = ["読み込んだPDFファイルの名前は「" + uploaded_file.name + "」です。"]
 
     # ['past']:ユーザーが入力したメッセージを保存
     if 'past' not in st.session_state:
-        st.session_state['past'] = []
+        st.session_state['past'] = ['読み込んだファイルの名前を教えて！']
 
-     
-    # 要約用のプロンプトテンプレート
-    summarize_prompt_template="""以下の文章を簡潔に要約してください。:
-    {text}
-    要約:"""    
-
-    # 
-    simplify_prompt_prefix = "元の文章の難しい表現を、元の意味を損なわないように注意して子ども向けのかんたんな表現に変換してください。語尾は「です」「ます」で統一してください。"
-
-    # 簡単な日本語変換を行った例文
-    simplify_examples = [
-        {
-            "元の文章": "綿密な計画のもと、彼は革命を起こし、王朝の支配に終止符を打った。",
-                    "かんたんな文章": "よく考えられた計画で、彼は国の政治や社会の仕組みを大きく変えました。そして、王様の家族がずっと支配していた時代が終わりました。"
-        },
-        {
-            "元の文章": "彼は無類の読書家であり、その博識ぶりは同僚からも一目置かれる存在だった。",
-                    "かんたんな文章": "彼はたくさんの本を読むのが大好きで、たくさんのことを知っています。友達も彼の知識を尊敬しています。"
-        },
-        {
-            "元の文章": "彼女は劇団に所属し、舞台で熱演を繰り広げ、観客を魅了していた。",
-                    "かんたんな文章": "彼女は劇のグループに入っていて、舞台でとても上手に演じて、見ている人たちを楽しませています。"
-        },
-        {
-
-            "元の文章": "宇宙の膨張は、エドウィン・ハッブルによって観測された銀河の運動から発見されました。",
-                    "かんたんな文章": "宇宙がどんどん広がっていることは、エドウィン・ハッブルさんがたくさんの星が集まった大きなものが動いていることを見つけることでわかりました。"
-        }
-    ]
-        
-    simplify_example_formatter_template = """
-    元の文章: {元の文章}\n
-    かんたんな文章: {かんたんな文章}
-    """
-
-    simplify_prompt_suffix = "元の文章: {input}\nかんたんな文章:"
-
-    # 簡単な日本語への変換
-    simpify_system_message = "あなたは文章を子ども向けのかんたんな日本語に変換するのに役立つアシスタントです。"
+    if 'summary' not in st.session_state:
+        st.session_state['summary'] = []
 
 
-    class PdfSimplySummarizer():
-        def __init__(self, llm :ChatOpenAI):
-            self.llm = llm
-
-        # 要約
-        def _summarize(self, langchain_documents: list) -> str:
-            # プロンプトテンプレートの作成
-            summarize_template = PromptTemplate(
-                template=summarize_prompt_template,
-                input_variables=["text"] # 代入する変数の指定
-                )
-
-            # 要約モデルの作成
-            chain_sum = load_summarize_chain(
-                llm = self.llm,
-                chain_type="map_reduce", # 処理の分散方法の指定
-                map_prompt=summarize_template,
-                combine_prompt=summarize_template
-            )
-
-            # 文章の要約
-            summary = chain_sum.run(
-                inputs=langchain_documents,
-                return_only_outputs=True)
-            return summary
-
-        def _simplify(self, summary: str) -> str:
-            simplify_example_prompt = PromptTemplate(
-                input_variables=["元の文章", "かんたんな文章"],
-                template=simplify_example_formatter_template,
-            )
-
-            # FewShotPromptTemplate：教師データの入力に加えて、教師データをどのようなフォーマットで学習させるかも指定可能
-            simplify_few_shot_prompt_template = FewShotPromptTemplate(
-                examples=simplify_examples,
-                example_prompt=simplify_example_prompt,
-                prefix=simplify_prompt_prefix,
-                suffix=simplify_prompt_suffix,
-                input_variables=["input"],
-                example_separator="\n\n",
-            )
-
-            simplify_few_shot_prompt = simplify_few_shot_prompt_template.format(
-                input=summary)
-
-            # チャットモデルの呼び出し
-            messages = [
-                SystemMessage(content=simpify_system_message),
-                HumanMessage(content=simplify_few_shot_prompt),
-            ]
-            result = self.llm(messages)
-
-            return result.content
-
-        def run(self, langchain_documents: str):
-            summary = self._summarize(langchain_documents)
-            result = self._simplify(summary)
-            return result
-
+    query_sum = "読み込んだPDFファイルの内容を300字以内で要約してください。"
+    
     # 畳み込み可能な要約文の表示
-    with st.expander(label= uploaded_file.name + "の要約", expanded=False): # expanded=False 初期で展開しない
-        PSS = PdfSimplySummarizer(llm)
-        output_sum = PSS.run(vectors)
-        st.write(output_sum)  
-
+    with st.expander(label= uploaded_file.name + "の要約", expanded=True): # expanded=False 初期で展開しない
+        summary = conversational_chat(query_sum)
+        #st.session_state['summary'].append(HumanMessage(content=summarize_prompt_template))
+        # st.session_state['summary'].append(summary)
+        st.write(summary)
 
     # チャット履歴の表示
     response_container = st.container()
@@ -234,3 +146,5 @@ if uploaded_file :
             for i in range(len(st.session_state['generated'])):
                 message(st.session_state["past"][i], is_user=True, key=str(i) + '_user', avatar_style="big-smile")
                 message(st.session_state["generated"][i], key=str(i), avatar_style="thumbs")
+
+            
